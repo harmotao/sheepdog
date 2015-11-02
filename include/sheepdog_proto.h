@@ -83,6 +83,8 @@
 #define SD_RES_JOIN_FAILED   0x18 /* Target node had failed to join sheepdog */
 #define SD_RES_HALT          0x19 /* Sheepdog is stopped doing IO */
 #define SD_RES_READONLY      0x1A /* Object is read-only */
+/* inode object in client is invalidated, refreshing is required */
+#define SD_RES_INODE_INVALIDATED 0x1D
 
 /* errors above 0x80 are sheepdog-internal */
 
@@ -196,7 +198,9 @@ struct sd_req {
 		struct {
 			uint32_t        get; /* 0 means free, 1 means get */
 			uint32_t        tgt_epoch;
-		} vdi_state_snapshot;
+
+			uint32_t        vid; /* only used for get */
+		} vdi_state_checkpoint;
 		struct {
 			/* 1 means validate, 0 means invalidate */
 			uint32_t        vid;

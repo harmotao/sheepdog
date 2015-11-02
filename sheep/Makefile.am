@@ -24,10 +24,12 @@ AM_CPPFLAGS		= -I$(top_builddir)/include -I$(top_srcdir)/include \
 
 sbin_PROGRAMS		= sheep
 
-sheep_SOURCES		= sheep.c group.c request.c gateway.c store.c vdi.c \
+sheep_SOURCES		= sheep.c group.c request.c gateway.c vdi.c \
 			  journal.c ops.c recovery.c cluster/local.c \
 			  object_cache.c object_list_cache.c \
-			  plain_store.c config.c migrate.c md.c
+			  store/common.c store/md.c \
+			  store/plain_store.c store/tree_store.c \
+			  config.c migrate.c
 
 if BUILD_HTTP
 sheep_SOURCES		+= http/http.c http/kv.c http/s3.c http/swift.c \
@@ -53,14 +55,14 @@ AM_CPPFLAGS		+= -DENABLE_TRACE
 sheep_SOURCES		+= trace/trace.c trace/mcount.S trace/graph.c trace/checker.c
 endif
 
-sheep_LDADD	  	= ../lib/libsheepdog.a -lpthread -lm\
+sheep_LDADD	  	= ../lib/libsd.a -lpthread -lm\
 			  $(libcpg_LIBS) $(libcfg_LIBS) $(libacrd_LIBS) $(LIBS)
 
 if BUILD_NFS
 sheep_LDADD		+= -lrt
 endif
 
-sheep_DEPENDENCIES	= ../lib/libsheepdog.a
+sheep_DEPENDENCIES	= ../lib/libsd.a
 
 
 noinst_HEADERS		= sheep_priv.h cluster.h http/http.h trace/trace.h

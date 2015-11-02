@@ -12,6 +12,7 @@
  */
 
 #include "sheepdog.h"
+#include "internal.h"
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -62,6 +63,9 @@ static int sheep_submit_sdreq(struct sd_cluster *c, struct sd_req *hdr,
 		ret = xwrite(c->sockfd, data, wlen);
 out:
 	sd_mutex_unlock(&c->submit_mutex);
+	if (unlikely(ret < 0))
+		return -SD_RES_EIO;
+
 	return ret;
 }
 
@@ -82,11 +86,11 @@ int sd_run_sdreq(struct sd_cluster *c, struct sd_req *hdr, void *data)
 
 	ret = sheep_submit_sdreq(c, hdr, data, wlen);
 	if (ret < 0)
-		return ret;
+		return SD_RES_SYSTEM_ERROR;
 
 	ret = xread(c->sockfd, rsp, sizeof(*rsp));
 	if (ret < 0)
-		return ret;
+		return SD_RES_SYSTEM_ERROR;
 
 	if (rlen > rsp->data_length)
 		rlen = rsp->data_length;
@@ -94,20 +98,10 @@ int sd_run_sdreq(struct sd_cluster *c, struct sd_req *hdr, void *data)
 	if (rlen) {
 		ret = xread(c->sockfd, data, rlen);
 		if (ret < 0)
-			return ret;
+			return SD_RES_SYSTEM_ERROR;
 	}
 
-	switch (rsp->result) {
-	case SD_RES_SUCCESS:
-		break;
-	case SD_RES_NO_OBJ:
-	case SD_RES_NO_VDI:
-		return -ENOENT;
-	default:
-		return -EIO;
-	}
-
-	return 0;
+	return rsp->result;
 }
 
 static void aio_end_request(struct sd_request *req, int ret)
@@ -173,7 +167,6 @@ static void end_sheep_request(struct sheep_request *req)
 	free(req);
 }
 
-/* FIXME: handle submit failure */
 static int submit_sheep_request(struct sheep_request *req)
 {
 	struct sd_req hdr = {};
@@ -282,9 +275,6 @@ static int sheep_aiocb_submit(struct sheep_aiocb *aiocb)
 		}
 
 		req = alloc_sheep_request(aiocb, oid, cow_oid, len, start);
-		if (IS_ERR(req))
-			return PTR_ERR(req);
-
 		if (vid && !cow_oid)
 			goto submit;
 
@@ -336,9 +326,6 @@ done:
 static int submit_request(struct sd_request *req)
 {
 	struct sheep_aiocb *aiocb = sheep_aiocb_setup(req);
-
-	if (IS_ERR(aiocb))
-		return PTR_ERR(aiocb);
 
 	return sheep_aiocb_submit(aiocb);
 }
@@ -429,7 +416,7 @@ static int sheep_handle_reply(struct sd_cluster *c)
 	if (ret < 0) {
 		req = fetch_first_inflight_request(c);
 		if (req != NULL) {
-			req->aiocb->ret = EIO;
+			req->aiocb->ret = SD_RES_EIO;
 			goto end_request;
 		}
 		goto err;
@@ -441,7 +428,7 @@ static int sheep_handle_reply(struct sd_cluster *c)
 	if (rsp.data_length > 0) {
 		ret = xread(c->sockfd, req->buf, req->length);
 		if (ret < 0) {
-			req->aiocb->ret = EIO;
+			req->aiocb->ret = SD_RES_EIO;
 			goto end_request;
 		}
 	}
@@ -491,7 +478,9 @@ static void *reply_handler(void *data)
 	       !list_empty(&c->inflight_list)) {
 		bool empty;
 
-		eventfd_xread(c->reply_fd);
+		uint64_t events;
+		events = eventfd_xread(c->reply_fd);
+
 		sd_read_lock(&c->inflight_lock);
 		empty = list_empty(&c->inflight_list);
 		sd_rw_unlock(&c->inflight_lock);
@@ -499,7 +488,8 @@ static void *reply_handler(void *data)
 		if (empty)
 			continue;
 
-		sheep_handle_reply(c);
+		for (uint64_t i = 0; i < events; i++)
+			sheep_handle_reply(c);
 
 	}
 	pthread_detach(pthread_self());
@@ -513,12 +503,12 @@ static int init_cluster_handlers(struct sd_cluster *c)
 
 	c->request_fd = eventfd(0, 0);
 	if (c->request_fd < 0)
-		return -errno;
+		return -SD_RES_SYSTEM_ERROR;
 
 	c->reply_fd = eventfd(0, 0);
 	if (c->reply_fd < 0) {
 		close(c->request_fd);
-		return -errno;
+		return -SD_RES_SYSTEM_ERROR;
 	}
 
 	ret = pthread_create(&thread, NULL, request_handler, c);
@@ -538,7 +528,7 @@ static int init_cluster_handlers(struct sd_cluster *c)
 	}
 	c->reply_thread = thread;
 
-	return 0;
+	return SD_RES_SUCCESS;
 }
 
 struct sd_cluster *sd_connect(char *host)
@@ -552,33 +542,39 @@ struct sd_cluster *sd_connect(char *host)
 
 	ip = strtok(h, ":");
 	if (!ip) {
-		errno = EINVAL;
+		errno = SD_RES_INVALID_PARMS;
 		goto err;
 	}
 
 	pt = strtok(NULL, ":");
 	if (!pt) {
-		errno = EINVAL;
+		errno = SD_RES_INVALID_PARMS;
 		goto err;
 	}
 
 	if (sscanf(pt, "%u", &port) != 1) {
-		errno = EINVAL;
+		errno = SD_RES_INVALID_PARMS;
 		goto err;
 	}
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (fd < 0)
+	if (fd < 0) {
+		errno = SD_RES_SYSTEM_ERROR;
 		goto err;
+	}
 
 	ret = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_opt,
 			 sizeof(linger_opt));
-	if (ret < 0)
+	if (ret < 0) {
+		errno = SD_RES_SYSTEM_ERROR;
 		goto err_close;
+	}
 
 	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
-	if (ret < 0)
+	if (ret < 0) {
+		errno = SD_RES_SYSTEM_ERROR;
 		goto err_close;
+	}
 
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
@@ -587,13 +583,15 @@ struct sd_cluster *sd_connect(char *host)
 	case 1:
 		break;
 	default:
-		errno = EINVAL;
+		errno = SD_RES_INVALID_PARMS;
 		goto err_close;
 	}
 
 	ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-	if (ret < 0)
+	if (ret < 0) {
+		errno = SD_RES_SYSTEM_ERROR;
 		goto err_close;
+	}
 
 	c = xzalloc(sizeof(*c));
 	c->sockfd = fd;
@@ -638,5 +636,6 @@ int sd_disconnect(struct sd_cluster *c)
 	close(c->reply_fd);
 	close(c->sockfd);
 	free(c);
-	return 0;
+
+	return SD_RES_SUCCESS;
 }

@@ -1345,7 +1345,7 @@ out:
 /*
  * Return SUCCESS (range of bits set):
  * Iff we get a bitmap range [left, right) that VDI might be set between. if
- * right < start, this means a wrap around case where we should examine the
+ * right < left, this means a wrap around case where we should examine the
  * two split ranges, [left, SD_NR_VDIS - 1] and [0, right). 'Right' is the free
  * bit that might be used by newly created VDI.
  *
@@ -1356,13 +1356,17 @@ static int get_vdi_bitmap_range(const char *name, unsigned long *left,
 				unsigned long *right)
 {
 	*left = sd_hash_vdi(name);
+
+	if (unlikely(!*left))
+		*left = 1;	/* 0x000000 should be skipeed */
+
 	*right = find_next_zero_bit(sys->vdi_inuse, SD_NR_VDIS, *left);
 	if (*left == *right)
 		return SD_RES_NO_VDI;
 
 	if (*right == SD_NR_VDIS) {
 		/* Wrap around */
-		*right = find_next_zero_bit(sys->vdi_inuse, SD_NR_VDIS, 0);
+		*right = find_next_zero_bit(sys->vdi_inuse, SD_NR_VDIS, 1);
 		if (*right == SD_NR_VDIS)
 			return SD_RES_FULL_VDI;
 	}
@@ -1394,19 +1398,24 @@ static int fill_vdi_info_range(uint32_t left, uint32_t right,
 {
 	struct sd_inode *inode;
 	bool vdi_found = false;
-	int ret;
+	int ret = SD_RES_NO_VDI;
 	uint32_t i;
 	const char *name = iocb->name;
 
-	inode = malloc(SD_INODE_HEADER_SIZE);
+	inode = malloc(offsetof(struct sd_inode, btree_counter));
 	if (!inode) {
 		sd_err("failed to allocate memory");
 		ret = SD_RES_NO_MEM;
 		goto out;
 	}
-	for (i = right - 1; i >= left; i--) {
+	for (i = right - 1; i >= left && i; i--) {
+		if (!test_bit(i, sys->vdi_inuse) &&
+		    !test_bit(i, sys->vdi_deleted))
+			continue;
+
 		ret = sd_read_object(vid_to_vdi_oid(i), (char *)inode,
-				     SD_INODE_HEADER_SIZE, 0);
+				     offsetof(struct sd_inode, btree_counter),
+				     0);
 		if (ret != SD_RES_SUCCESS)
 			goto out;
 
@@ -1417,6 +1426,7 @@ static int fill_vdi_info_range(uint32_t left, uint32_t right,
 				/* Read, delete, clone on snapshots */
 				if (!vdi_is_snapshot(inode)) {
 					vdi_found = true;
+					info->vid = inode->vdi_id;
 					continue;
 				}
 				if (!vdi_tag_match(iocb, inode))
@@ -1427,9 +1437,11 @@ static int fill_vdi_info_range(uint32_t left, uint32_t right,
 				 * current working VDI
 				 */
 				info->snapid = inode->snap_id + 1;
-				if (vdi_is_snapshot(inode))
+				if (vdi_is_snapshot(inode)) {
 					/* Current working VDI is deleted */
+					info->vid = inode->vdi_id;
 					break;
+				}
 			}
 			info->create_time = inode->create_time;
 			info->vid = inode->vdi_id;
@@ -1448,14 +1460,24 @@ static int fill_vdi_info(unsigned long left, unsigned long right,
 {
 	int ret;
 
+	assert(left != right);
+	/*
+	 * If left == right, fill_vdi_info() shouldn't called by vdi_lookup().
+	 * vdi_lookup() must return SD_RES_NO_VDI to its caller.
+	 */
+
 	if (left < right)
 		return fill_vdi_info_range(left, right, iocb, info);
 
-	ret = fill_vdi_info_range(0, right, iocb, info);
+	if (likely(1 < right))
+		ret = fill_vdi_info_range(1, right, iocb, info);
+	else
+		ret = SD_RES_NO_VDI;
+
 	switch (ret) {
 	case SD_RES_NO_VDI:
 	case SD_RES_NO_TAG:
-		ret = fill_vdi_info_range(left, SD_NR_VDIS - 1, iocb, info);
+		ret = fill_vdi_info_range(left, SD_NR_VDIS, iocb, info);
 		break;
 	default:
 		break;
@@ -1469,17 +1491,93 @@ int vdi_lookup(const struct vdi_iocb *iocb, struct vdi_info *info)
 	unsigned long left, right;
 	int ret;
 
-	ret = get_vdi_bitmap_range(iocb->name, &left, &right);
-	info->free_bit = right;
-	sd_debug("%s left %lx right %lx, %x", iocb->name, left, right, ret);
-	switch (ret) {
-	case SD_RES_NO_VDI:
-	case SD_RES_FULL_VDI:
+	if (!(sys->cinfo.flags & SD_CLUSTER_FLAG_RECYCLE_VID)) {
+		ret = get_vdi_bitmap_range(iocb->name, &left, &right);
+		info->free_bit = right;
+		sd_debug("%s left %lx right %lx, %x", iocb->name, left, right,
+			 ret);
+		switch (ret) {
+		case SD_RES_NO_VDI:
+		case SD_RES_FULL_VDI:
+			return ret;
+		case SD_RES_SUCCESS:
+			break;
+		}
+		return fill_vdi_info(left, right, iocb, info);
+	} else {
+		/*
+		 * Why is the below heavy fill_vdi_info_range() required?
+		 *
+		 * Older sheepdog didn't have a functionality of recycling VID,
+		 * so the above get_vdi_bitmap_range() can detect correct range
+		 * of bitmap.
+		 *
+		 * But newer sheepdog (1.0 <=) recycles VID if a cluster is
+		 * formatted with -R option. It can produce situations like
+		 * below:
+		 *
+		 * The first state of VID bitmap:
+		 * 0 0 1* 1* 1 0 0 0
+		 * 1 is a VID bit of working VDI, 1* is a bit of snapshot.
+		 * Assume the above 1 and 1* are used for VDI named "A" and
+		 * its snapshots.
+		 *
+		 * Then, a user tries to create VDI "B". sd_hash_vdi() returns
+		 * VID which conflicts with existing bits for A.
+		 * 0 0 1* 1* 1 0 0 0
+		 *        ^
+		 *        |
+		 *        sd_hash_vdi() returns VID which conflicts with the
+		 *        above bit.
+		 *
+		 * So B acquires the left most free bit
+		 * 0 0 1* 1* 1 1 0 0
+		 *             ^
+		 *             |
+		 *             B acquires this bit.
+		 *
+		 * Then, the user deletes A and its snapshots. All of the family
+		 * members are deleted. The bitmap becomes like below
+		 * 0 0 0 0 0 1 0 0
+		 *       ^
+		 *       |
+		 *       B's original VID sd_hash_vdi() calculates.
+		 *
+		 * Now sheep fails to lookup VID of B, because the VID
+		 * calculated by sd_hash_vdi().
+		 *
+		 * The problem comes from that vdi bitmap is a hashtable with
+		 * open addressing. Deleting a member from the table requires
+		 * changeing places of the members. It is virtually impossible
+		 * in a case of sheepdog (every inode object must be updated).
+		 *
+		 * This is the reason of the below fill_vdi_info(). Of course it
+		 * is ugly and costly. But its cost is equal or less than
+		 * "dog vdi list"'s one.
+		 */
+
+		info->free_bit = find_next_zero_bit(sys->vdi_inuse,
+						    SD_NR_VDIS, 1);
+		ret = fill_vdi_info_range(1, SD_NR_VDIS, iocb, info);
+		if (ret == SD_RES_NO_VDI && info->vid != 0) {
+			/*
+			 * handle a case like below:
+			 * 1. create A
+			 * 2. create snapshots of A
+			 * 3. delete A
+			 * 4. create A again
+			 *
+			 * The inode object of A created in 1 shouldn't be
+			 * overwritten because snapshots created in 2 depend
+			 * on it.
+			 */
+
+			if (test_bit(info->vid, sys->vdi_inuse))
+				return SD_RES_SUCCESS;
+		}
+
 		return ret;
-	case SD_RES_SUCCESS:
-		break;
 	}
-	return fill_vdi_info(left, right, iocb, info);
 }
 
 static int notify_vdi_add(uint32_t vdi_id, uint32_t nr_copies, uint32_t old_vid,
@@ -2020,83 +2118,107 @@ out:
 	return ret;
 }
 
-struct vdi_state_snapshot {
+struct vdi_state_checkpoint {
 	int epoch, nr_vs;
 	struct vdi_state *vs;
 
 	struct list_node list;
 };
 
-static LIST_HEAD(vdi_state_snapshot_list);
+static LIST_HEAD(vdi_state_checkpoint_list);
 
-main_fn void take_vdi_state_snapshot(int epoch)
+main_fn void create_vdi_state_checkpoint(int epoch)
 {
 	/*
-	 * take a snapshot of current vdi state and associate it with
+	 * take a checkpoint of current vdi state and associate it with
 	 * the given epoch
 	 */
-	struct vdi_state_snapshot *snapshot;
+	struct vdi_state_checkpoint *checkpoint;
 
-	list_for_each_entry(snapshot, &vdi_state_snapshot_list, list) {
-		if (snapshot->epoch == epoch) {
-			sd_debug("duplicate snapshot of epoch %d", epoch);
+	list_for_each_entry(checkpoint, &vdi_state_checkpoint_list, list) {
+		if (checkpoint->epoch == epoch) {
+			sd_debug("duplicate checkpoint of epoch %d", epoch);
 			return;
 		}
 
 	}
 
-	snapshot = xzalloc(sizeof(*snapshot));
-	snapshot->epoch = epoch;
-	snapshot->vs = fill_vdi_state_list_with_alloc(&snapshot->nr_vs);
-	INIT_LIST_NODE(&snapshot->list);
-	list_add_tail(&snapshot->list, &vdi_state_snapshot_list);
+	checkpoint = xzalloc(sizeof(*checkpoint));
+	checkpoint->epoch = epoch;
+	checkpoint->vs = fill_vdi_state_list_with_alloc(&checkpoint->nr_vs);
+	INIT_LIST_NODE(&checkpoint->list);
+	list_add_tail(&checkpoint->list, &vdi_state_checkpoint_list);
 
-	sd_debug("taking a snapshot of vdi state at epoch %d succeed", epoch);
-	sd_debug("a number of vdi state: %d", snapshot->nr_vs);
+	sd_debug("creating a checkpoint of vdi state at epoch %d succeed",
+		 epoch);
+	sd_debug("a number of vdi state: %d", checkpoint->nr_vs);
 }
 
-main_fn int get_vdi_state_snapshot(int epoch, void *data, int data_len_max,
-				   int *data_len_result)
+main_fn int get_vdi_state_checkpoint(int epoch, uint32_t vid, void *data)
 {
-	struct vdi_state_snapshot *snapshot;
-	int len;
+	struct vdi_state_checkpoint *checkpoint;
+	struct vdi_state *vs;
 
-	list_for_each_entry(snapshot, &vdi_state_snapshot_list, list) {
-		if (snapshot->epoch == epoch)
-			goto found;
+	list_for_each_entry(checkpoint, &vdi_state_checkpoint_list, list) {
+		if (checkpoint->epoch == epoch) {
+			for (int i = 0; i < checkpoint->nr_vs; i++) {
+				if (checkpoint->vs[i].vid == vid) {
+					vs = &checkpoint->vs[i];
+					goto found;
+				}
+			}
+
+			sd_info("this node doesn't have a required entry of VID:"
+				" %"PRIx32" at epoch %d", vid, epoch);
+			return SD_RES_NO_CHECKPOINT_ENTRY;
+		}
 	}
 
-	sd_info("get request for not prepared vdi state snapshot, epoch: %d",
+	sd_info("get request for not prepared vdi state checkpoint, epoch: %d",
 		epoch);
 	return SD_RES_AGAIN;
 
 found:
-	len = sizeof(*snapshot->vs) * snapshot->nr_vs;
-	if (data_len_max < len) {
-		sd_info("maximum allowed length: %d, required length: %d",
-			data_len_max, len);
-		return SD_RES_BUFFER_SMALL;
-	}
-
-	memcpy(data, snapshot->vs, len);
+	memcpy(data, vs, sizeof(*vs));
 	return SD_RES_SUCCESS;
 }
 
-main_fn void free_vdi_state_snapshot(int epoch)
+main_fn void free_vdi_state_checkpoint(int epoch)
 {
-	struct vdi_state_snapshot *snapshot;
+	struct vdi_state_checkpoint *checkpoint;
 
-	list_for_each_entry(snapshot, &vdi_state_snapshot_list, list) {
-		if (snapshot->epoch == epoch) {
-			list_del(&snapshot->list);
-			free(snapshot->vs);
-			free(snapshot);
+	list_for_each_entry(checkpoint, &vdi_state_checkpoint_list, list) {
+		if (checkpoint->epoch == epoch) {
+			list_del(&checkpoint->list);
+			free(checkpoint->vs);
+			free(checkpoint);
 
 			return;
 		}
 	}
 
-	panic("invalid free request for vdi state snapshot, epoch: %d", epoch);
+	panic("invalid free request for vdi state checkpoint, epoch: %d",
+	      epoch);
+}
+
+static int clean_matched_obj(uint64_t oid, const char *path,
+			     uint32_t epoch, uint8_t ec_index,
+			     struct vnode_info *vinfo, void *arg)
+{
+	uint32_t vid = oid_to_vid(*(uint64_t *)arg);
+	int ret = SD_RES_SUCCESS;
+
+	if (oid_to_vid(oid) == vid) {
+		sd_info("removing object %"PRIx64" (path: %s), it means the"
+			" object is leaked", oid, path);
+		ret = unlink(path);
+		if (ret) {
+			sd_err("failed to unlink %s", path);
+			ret = SD_RES_EIO;
+		}
+	}
+
+	return ret;
 }
 
 static main_fn void do_vid_gc(struct vdi_family_member *member)
@@ -2118,9 +2240,10 @@ static main_fn void do_vid_gc(struct vdi_family_member *member)
 
 	free(member);
 
-	if (sd_store && sd_store->exist(oid, -1))
-		/* TODO: gc other objects */
+	if (sd_store && sd_store->exist(oid, -1)) {
 		sd_store->remove_object(oid, -1);
+		for_each_object_in_wd(clean_matched_obj, false, &oid);
+	}
 
 	atomic_clear_bit(vid, sys->vdi_inuse);
 	atomic_clear_bit(vid, sys->vdi_deleted);

@@ -108,7 +108,7 @@
 #define SD_OP_ALLOW_INODE_UPDATE      0xC4
 #define SD_OP_REPAIR_REPLICA	0xC5
 #define SD_OP_OIDS_EXIST	0xC6
-#define SD_OP_VDI_STATE_SNAPSHOT_CTL  0xC7
+#define SD_OP_VDI_STATE_CHECKPOINT_CTL  0xC7
 #define SD_OP_INODE_COHERENCE 0xC8
 #define SD_OP_READ_DEL_VDIS  0xC9
 #define SD_OP_GET_RECOVERY      0xCA
@@ -147,11 +147,10 @@
 #define SD_RES_INCOMPLETE    0x94 /* Object (in kv) is incomplete uploading */
 /* sheep is collecting cluster wide status, not ready for operation */
 #define SD_RES_COLLECTING_CINFO 0x95
-/* inode object in client is invalidated, refreshing is required */
-#define SD_RES_INODE_INVALIDATED 0x96
 #define SD_RES_GATEWAY_MODE  0x97 /* Target node is gateway mode */
 #define SD_RES_INVALID_VNODES_STRATEGY 0x98 /* Invalid vnodes strategy */
-
+/* Node doesn't have a required entry of checkpoint */
+#define SD_RES_NO_CHECKPOINT_ENTRY 0x99
 
 #define SD_CLUSTER_FLAG_STRICT		0x0001 /* Strict mode for write */
 #define SD_CLUSTER_FLAG_DISKMODE	0x0002 /* Disk mode for cluster */
